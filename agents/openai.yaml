@@ -1,0 +1,4 @@
+interface:
+  display_name: "Optimize Torch Inference"
+  short_description: "Optimize PyTorch inference for chosen goals"
+  default_prompt: "Use $optimize-torch-inference to clarify the target objective and hardware access, profile this PyTorch inference workload, implement the best candidate, and prove the result."

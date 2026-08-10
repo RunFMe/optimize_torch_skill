@@ -21,8 +21,9 @@ Drive optimization with measured critical-path evidence. Treat traces as diagnos
 10. Keep benchmark harnesses, traces, screenshots, generated outputs, and large artifacts outside the implementation diff unless explicitly requested.
 11. Maintain the decision ledger during the campaign, including rejected and deferred experiments. Do not reconstruct it from memory at delivery.
 12. Use independent review of expensive experiment designs and implemented winners. Fix material findings and rerun proof.
+13. Screen dominant dense kernels against an exact-shape roofline and competing kernel families. A large GEMM is not automatically efficient, and a library default is not evidence of good tensor-core utilization.
 
-Read [trace-analysis.md](references/trace-analysis.md) before interpreting a trace. Read [optimization-catalog.md](references/optimization-catalog.md) when ranking candidates. Read [benchmark-quality.md](references/benchmark-quality.md) before making a speed or parity claim. For a campaign with multiple hypotheses, compilation, lower precision, custom kernels, distributed execution, or host pipelining, also read [campaign-playbook.md](references/campaign-playbook.md).
+Read [trace-analysis.md](references/trace-analysis.md) before interpreting a trace. Read [optimization-catalog.md](references/optimization-catalog.md) when ranking candidates. Read [benchmark-quality.md](references/benchmark-quality.md) before making a speed or parity claim. Read [kernel-roofline.md](references/kernel-roofline.md) when GEMM, convolution, attention, or another compute-dense kernel has material critical-path share or unexpectedly low achieved throughput. For a campaign with multiple hypotheses, compilation, lower precision, custom kernels, distributed execution, or host pipelining, also read [campaign-playbook.md](references/campaign-playbook.md).
 
 ## 1. Establish The Contract
 
@@ -175,6 +176,8 @@ Choose the highest-value candidate that has:
 - A validation plan that can detect silent corruption.
 
 Start with an exact-shape microbenchmark for custom kernels and collectives. Then implement the smallest runtime change that tests the hypothesis.
+
+When a dense kernel dominates, calculate useful work, achieved throughput, and a realistic observed-condition or empirical ceiling before writing a replacement. Search available vendor and specialized kernels first, profile the strongest contrasting implementations, then retune the complete production shape family rather than only the shape that exposed the problem. Follow [kernel-roofline.md](references/kernel-roofline.md).
 
 Use three gates for expensive candidates:
 

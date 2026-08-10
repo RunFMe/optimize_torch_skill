@@ -109,6 +109,7 @@ For CUDA, Triton, or CuTe kernels:
 
 ## 4. GEMM, Quantization, And Block Fusion
 
+- Run an exact-shape dense-kernel roofline search when GEMMs have material exposed time: calculate useful FLOP/s, compare compatible backend families, profile contrasting finalists, and retune the production shape family before writing a one-off kernel.
 - Use Nsight Compute before replacing cuBLASLt, CUTLASS, nvJet, or other tuned vendor kernels.
 - Prepack stable FP8 weights and scales when runtime patching does not mutate them.
 - Fuse scale, bias, activation, quantization, and output conversion into GEMM epilogues when the backend supports it.

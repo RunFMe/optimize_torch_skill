@@ -40,11 +40,11 @@ Capture requirements depend on which views you need:
 | Execution mode | Shapes and roofline | Agent analysis |
 |---|---|---|
 | Eager | Yes, with `record_shapes=True` | Supported |
-| CUDA-graph replay only | Only for kernels outside graphs | Do not run |
+| CUDA-graph replay only | Only for kernels outside graphs | Not on one trace; two traces only in reduced `semantic` comparison |
 | Graph replay plus an eager-mode trace | Limited | Limited |
 | Graph replay plus graph-capture traces | Yes | Supported |
 
-"Agent analysis" refers to the TraceLens Agent (section 5); do not run it on graph replay alone.
+"Agent analysis" refers to the TraceLens Agent (section 5); do not run it on a single graph-replay-only trace.
 
 For CUDA-graph serving (SGLang, vLLM, ATOM, xDiT), the full views need TraceLens's framework
 patches, which annotate request packing and trace the graph-capture phase. They live under
@@ -214,9 +214,13 @@ paths). The simplest route is to copy your measured file into the installed `uti
 
 Use it as a source of leads, not as a verdict:
 
-- Do not run it on plain graph-replay traces. A standalone `graph_replay_only` run aborts, and a
-  trace where too little of the graph replay was recorded (`GRAPH_REPLAY_FRACTION_MAX = 0.10`)
-  produces only a deterministic fallback report. Capture graph-capture traces first (section 2).
+- Do not run it on a single graph-replay-only trace: its orchestrator's `reference.md` says to
+  abort standalone `graph_replay_only` runs. Two such traces can be compared, but only in a
+  reduced `semantic` mode. Separately, whenever more than 10% of kernel time is attributed to
+  `cudaGraphLaunch` rather than to ops (`GRAPH_REPLAY_FRACTION_MAX = 0.10` in
+  `utils/deterministic_fallback.py`), it skips the LLM analysis and writes a degraded report with
+  only kernel name, time and %E2E. On graph-replay SGLang traces that share is typically far above
+  10%. Capture graph-capture traces first (section 2).
 - Each finding is a candidate for the ledger only after you locate it in the event data (time,
   rank, stream, launching call) and estimate its exposed time. Impact scores are not Amdahl
   ceilings.
@@ -281,17 +285,19 @@ Under CUDA graphs the module view puts nearly all GPU time under "Non-nn.Module 
 no longer exist (for example `TraceDiff.get_corresponding_uid`; use `td.merged_uid_map`); trust
 the source over the notebooks.
 
-Tools that live in the repository's `examples/` rather than the package. Clone the pinned commit
-to use them:
+Tools that live in the repository's `examples/` rather than the package. Fetch only the pinned
+commit (a full clone is 1.8 GB):
 
 ```bash
-git clone https://github.com/AMD-AGI/TraceLens.git tracelens-src && git -C tracelens-src checkout 994da91
+git init -q tracelens-src && git -C tracelens-src fetch -q --depth 1 \
+  https://github.com/AMD-AGI/TraceLens.git 994da915a46152bb30a293357a4b604ae6b03338 \
+  && git -C tracelens-src checkout -q FETCH_HEAD
 ```
 
 | Tool | Use |
 |---|---|
-| `examples/custom_workflows/trace_checker.py TRACE --framework pytorch --phase 1` | Pre-flight trace quality: dropped kernels, runtime variability, whether shapes and stacks are present. Run it before trusting any analysis. |
-| `TraceFuse(rank_paths).merge_and_save(out, filter_fn=..., include_pyfunc=False)` | Merge all ranks into one Chrome JSON, optionally filtered (for example to collectives), to render ranks side by side. It needs `args` on every event, so crop without `--strip-args`; it appends `.gz` to the output name and drops `python_function` events unless `include_pyfunc=True`. |
+| `examples/custom_workflows/trace_checker.py TRACE --framework pytorch --phase 1` | Pre-flight trace quality: dropped kernels, runtime variability, whether shapes and stacks are present. Run it before trusting any analysis. On live-serving traces its dropped-kernel check can fail on a host-only stretch with no traffic (for example a long prefix before the first request); check for such a stretch before treating it as lost GPU events. |
+| `TraceFuse(rank_paths).merge_and_save(out, filter_fn=..., include_pyfunc=False)` | Merge all ranks into one Chrome JSON, optionally filtered (for example to collectives), to render ranks side by side. It needs `args` on every event, so crop without `--strip-args`; it appends `.gz` to the output name (the renderer reads `.gz`) and drops `python_function` events unless `include_pyfunc=True`. Merge two ranks at a time with a `filter_fn`. |
 | `examples/custom_workflows/traceMap/main.py --trace1 A --trace2 B --output x.html` | Interactive HTML (Bokeh) of per-kernel latency by launch index plus kernel tables, for two traces side by side. Good for spotting outlier kernels; it has no streams, CPU lanes or wall-clock axis, so it is not a timeline. It loads Bokeh from a CDN. |
 | `examples/custom_workflows/roofline_analyzer/main.py report.xlsx cfg.toml --plot-output roofline.png` | Roofline PNG from a report that has shape columns. |
 | `TraceLens.PerfModel.perf_model.GEMM.flops_func(M, N, K, bias)`, `.bytes_func(...)`, `SDPA.flops_func(...)` | Speed-of-light FLOPs and bytes from shapes alone, without a trace. |

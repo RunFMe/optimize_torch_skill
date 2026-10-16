@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import gzip
 import heapq
 import json
@@ -139,6 +140,24 @@ def merge_intervals(
     return [(start, end) for start, end in merged]
 
 
+def busy_overlap(
+    merged: list[tuple[float, float]], starts: list[float], start: float, end: float
+) -> float:
+    """Busy time of the merged, sorted intervals inside [start, end]."""
+    busy = 0.0
+    index = max(0, bisect.bisect_right(starts, start) - 1)
+    while index < len(merged) and merged[index][0] < end:
+        busy += max(0.0, min(end, merged[index][1]) - max(start, merged[index][0]))
+        index += 1
+    return busy
+
+
+def stage_key(name: str, category: str) -> str:
+    """Group per-call names such as `step[DECODE bs=4 ...]` by their head; keep CPU and GPU copies apart."""
+    head = name.split(maxsplit=1)[0] if "[" in name else name
+    return f"{head} [{category}]"
+
+
 def format_ms(us: float) -> str:
     return f"{us / 1000.0:.3f} ms"
 
@@ -155,12 +174,40 @@ def print_name_stats(title: str, stats: dict[str, NameStat], top: int) -> None:
         )
 
 
+def print_collectives(
+    events: list[tuple[str, str, float, float]],
+    merged_gpu: list[tuple[float, float]],
+    top: int,
+) -> None:
+    """Collective-like events by category and name, with the part inside the GPU-active window.
+
+    Host collectives outside the window are usually idle polling for work."""
+    window = (merged_gpu[0][0], merged_gpu[-1][1]) if merged_gpu else None
+    stats: dict[tuple[str, str], list[float]] = defaultdict(lambda: [0, 0.0, 0.0, 0.0])
+    for category, name, ts, duration_us in events:
+        stat = stats[(category, name)]
+        stat[0] += 1
+        stat[1] += duration_us
+        stat[2] = max(stat[2], duration_us)
+        if window:
+            stat[3] += max(0.0, min(ts + duration_us, window[1]) - max(ts, window[0]))
+    print("\nCollective-like events by category (do not add rows across categories)")
+    print(f"{'total':>13} {'in GPU window':>13} {'max':>13} {'count':>9}  category: name")
+    for (category, name), (count, total, longest, inside) in sorted(
+        stats.items(), key=lambda item: item[1][1], reverse=True
+    )[:top]:
+        print(
+            f"{format_ms(total):>13} {format_ms(inside):>13} {format_ms(longest):>13} "
+            f"{int(count):>9}  {category}: {name}"
+        )
+
+
 def summarize(
     path: Path, top: int, min_gap_us: float, stage_pattern: re.Pattern[str] | None
 ) -> None:
     name_stats: dict[str, NameStat] = defaultdict(NameStat)
     gpu_stats: dict[str, NameStat] = defaultdict(NameStat)
-    collective_stats: dict[str, NameStat] = defaultdict(NameStat)
+    collective_events: list[tuple[str, str, float, float]] = []
     sync_stats: dict[str, NameStat] = defaultdict(NameStat)
     copy_stats: dict[str, NameStat] = defaultdict(NameStat)
     stage_stats: dict[str, NameStat] = defaultdict(NameStat)
@@ -193,13 +240,13 @@ def summarize(
             gpu_stats[name].add(duration_us)
             gpu_intervals.append((ts, ts + duration_us))
         if COLLECTIVE_RE.search(name) or COLLECTIVE_RE.search(category):
-            collective_stats[name].add(duration_us)
+            collective_events.append((category, name, ts, duration_us))
         if SYNC_RE.search(name):
             sync_stats[name].add(duration_us)
         if COPY_RE.search(name) or COPY_RE.search(category):
             copy_stats[name].add(duration_us)
         if stage_pattern and stage_pattern.search(name):
-            stage_stats[name].add(duration_us)
+            stage_stats[stage_key(name, category)].add(duration_us)
         if LAUNCH_RE.search(name):
             launch_intervals.append((ts, ts + duration_us, name))
 
@@ -256,17 +303,24 @@ def summarize(
         for gap, start, end in heapq.nlargest(top, gaps):
             print(f"  {format_ms(gap):>13} at ts {start:.3f} -> {end:.3f}")
 
+    merged_starts = [start for start, _ in merged_gpu]
     launches = sorted(launch_intervals)
-    launch_gaps = [
-        (next_start - end, end, next_start, next_name)
-        for (_, end, _), (next_start, _, next_name) in pairwise(launches)
-        if next_start - end >= min_gap_us
-    ]
+    launch_gaps = []
+    for (_, end, _), (next_start, _, next_name) in pairwise(launches):
+        gap = next_start - end
+        if gap >= min_gap_us:
+            idle = gap - busy_overlap(merged_gpu, merged_starts, end, next_start)
+            launch_gaps.append((idle, gap, end, next_start, next_name))
     print(f"Kernel-launch submission events: {len(launches):,}")
-    print(f"Launch submission gaps >= {min_gap_us:.0f} us: {len(launch_gaps):,}")
-    for gap, start, end, next_name in heapq.nlargest(top, launch_gaps):
+    print(
+        f"Launch submission gaps >= {min_gap_us:.0f} us: {len(launch_gaps):,} "
+        f"(GPU idle inside them: {format_ms(sum(gap[0] for gap in launch_gaps))}); "
+        "largest GPU-idle first"
+    )
+    for idle, gap, start, end, next_name in heapq.nlargest(top, launch_gaps):
         print(
-            f"  {format_ms(gap):>13} at ts {start:.3f} -> {end:.3f}; next={next_name}"
+            f"  {format_ms(gap):>13} gap, GPU idle {format_ms(idle)}, "
+            f"at ts {start:.3f} -> {end:.3f}; next={next_name}"
         )
 
     print_name_stats(
@@ -275,7 +329,7 @@ def summarize(
         top,
     )
     print_name_stats("Top GPU events by summed duration", gpu_stats, top)
-    print_name_stats("Collective-like events", collective_stats, top)
+    print_collectives(collective_events, merged_gpu, top)
     print_name_stats("Synchronization/scalar-read events", sync_stats, top)
     print_name_stats("Copy/transfer-like events", copy_stats, top)
     if stage_pattern:
@@ -312,8 +366,13 @@ def parse_args() -> argparse.Namespace:
         default=(
             r"(?:^|/)(?:request|input|load|preprocess|transfer|model|forward|infer|"
             r"iteration|decode|postprocess|serialize|persist|publish|respond)(?:/|$)"
+            r"|^step\["
         ),
-        help="regex used to select user stage ranges; pass an empty string to disable",
+        help=(
+            "regex used to select user stage ranges (default includes SGLang `step[...]`); "
+            "names are grouped by their first word and split by category; "
+            "pass an empty string to disable"
+        ),
     )
     return parser.parse_args()
 

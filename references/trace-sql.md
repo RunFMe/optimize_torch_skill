@@ -28,12 +28,12 @@ rank arrived first. Use TraceLens ([tracelens.md](tracelens.md)) for aggregated 
 
 ```bash
 uv run --with duckdb python - <<'EOF'
-import duckdb, glob, re
+import duckdb, glob, os, re
 con = duckdb.connect("trace.duckdb")
 con.execute("SET preserve_insertion_order = false")
 files = sorted(glob.glob("traces/*.trace.json.gz"))      # .json works too
 for i, path in enumerate(files):
-    rank = int(re.search(r"(?:TP|rank)[-_]?(\d+)", path).group(1))   # adapt to the file naming
+    rank = int(re.search(r"(?:TP|rank)[-_]?(\d+)", os.path.basename(path)).group(1))   # adapt to the naming
     con.execute(f"""
       {"CREATE OR REPLACE TABLE ev AS" if i == 0 else "INSERT INTO ev"}
       SELECT {rank} AS rank, e.name, e.cat, e.ph, e.pid->>'$' AS pid, e.tid->>'$' AS tid,

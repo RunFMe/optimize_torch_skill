@@ -50,6 +50,13 @@ benchmarks will run. If the target is unreachable, continue only with portable a
 explicitly labeled proxy screening; do not claim, reject, default-enable, or tune
 architecture-specific work from proxy performance as though it were target proof.
 
+**Trace-only review.** When the only input is existing traces, with no live user to ask and no
+target access, do not stop at the questions above. Infer the contract from what was captured with
+the traces (server or launcher configuration, profile request, model config), label every inferred
+field `inferred` and every hardware claim `unverified`, run sections 3 and 4 only, and mark every
+ledger Result `retest` or `defer`. List the questions that would have been asked; they become the
+first items of the follow-up plan.
+
 Verify claims against target behavior. Do not optimize an offload, cache miss, fallback, or startup path that representative workloads do not execute.
 
 Create an invariant manifest for baseline and candidate. Diff it before accepting results. Include all quality-sensitive settings, not only application configuration.
@@ -104,7 +111,9 @@ uv run python "$SKILL_DIR/scripts/compare_benchmarks.py" \
 Run at least three complete workload-shaped warmup invocations before entering the profiler, then
 capture the next representative invocation on every rank. Profiler-scheduled warmup steps are not a
 substitute when they alter lifecycle or dispatch behavior. Export Chrome JSON with
-`export_chrome_trace`, and record the profiler options with the trace.
+`export_chrome_trace`, and record the profiler options with the trace. Before trusting host
+timings, run the profiler-inflation check in [trace-analysis.md](references/trace-analysis.md)
+section 1, especially for traces captured by someone else.
 
 Use two diagnostic levels when needed:
 
@@ -118,11 +127,12 @@ do not wrap a tool in a new permanent script unless it will be reused across cam
 
 | Tool | Gives | Use for |
 |---|---|---|
-| `scripts/summarize_trace.py` | One streaming pass: span, GPU busy union, idle and launch gaps with timestamps, syncs, copies, collectives, lanes | First look at every trace |
+| `scripts/summarize_trace.py` | One streaming pass: span, GPU busy union, idle gaps, launch gaps with the GPU idle time inside each, syncs, copies, collectives by category, stages, lanes | First look at every trace |
 | TraceLens reports ([tracelens.md](references/tracelens.md)) | GPU time split into compute, exposed comm, memcpy and idle; kernels by parent op and stream; per-shape roofline; per-rank NCCL skew and bandwidth; trace diffs | Aggregation, collective health, before/after comparison |
 | TraceLens Agent (tracelens.md section 5) | Ranked findings with Insight, Action and Impact | A second set of leads on eager or graph-plus-capture traces |
 | DuckDB SQL ([trace-sql.md](references/trace-sql.md)) | Event-level answers in milliseconds after one load | Locating, windowing, zooming into a kernel, cross-rank alignment, any follow-up question |
-| `scripts/crop_trace.py` | A small Chrome JSON of one window, all lanes kept | Rendering and evidence |
+| `scripts/run_query.py` | Runs a saved `NN-name.sql` (with its `SET VARIABLE` lines, `--set` overrides) and writes `NN-name.csv` beside it | Every query whose number enters the ledger |
+| `scripts/crop_trace.py` | A small Chrome JSON of one window, all lanes kept, metadata first, enclosing Python frames dropped | Rendering and evidence |
 | `scripts/render_perfetto.py` | Perfetto screenshots of a crop | Evidence images |
 | `scripts/compare_benchmarks.py` | Unprofiled speed statistics | Speed proof (section 6) |
 
@@ -142,11 +152,19 @@ evidence/<trace-id>/
   tracelens/         TraceLens CSVs (per rank, collectives, comparisons)
   queries/           NN-<name>.sql and NN-<name>.csv: every query whose result backs a claim
   crops/, images/    crops and rendered evidence
+evidence/all-ranks/  cross-rank work: collective reports, cross-rank queries, merged crops
 ledger.md            the opportunity ledger (section 4), one per campaign, next to evidence/
 ```
 
 Save a query and its output whenever a number from it enters the ledger, so it can be rerun on the
-after-trace unchanged. Update `ledger.md` after every run or review rather than keeping state in the
+after-trace unchanged:
+
+```bash
+uv run --with duckdb python "$SKILL_DIR/scripts/run_query.py" evidence/r0/queries/03-gpu-gaps.sql \
+  --db trace.duckdb [--set rank=1 --output evidence/r1/queries/03-gpu-gaps.csv]
+```
+
+Update `ledger.md` after every run or review rather than keeping state in the
 conversation; long campaigns lose context, the files do not.
 
 Cite every number in the ledger and report by its file and row, column or field, for example
@@ -158,8 +176,8 @@ that has no source file; compute it and save it first.
 
 Collect leads from three sources and tag each ledger row with its source:
 
-1. **Required checks.** Answer every measurement in [trace-analysis.md](references/trace-analysis.md) section 2 with a number and a location.
-2. **TraceLens.** Run the per-rank report and, for distributed jobs, the collective report. Optionally run the TraceLens Agent and read its `analysis.md`. Apply the cross-checks in tracelens.md section 6 before using any of its numbers.
+1. **Required checks.** Answer every measurement in [trace-analysis.md](references/trace-analysis.md) section 2 with a number and a location. When the trace cannot answer one (no shapes, no memory events, CUDA-graph replay hiding ops), write `N/A` with the reason and the capture that would answer it.
+2. **TraceLens.** Run the per-rank report and, for distributed jobs, the collective report. Optionally run the TraceLens Agent and read its `analysis.md`, but not on a single graph-replay-only trace (tracelens.md section 5). Apply the cross-checks in tracelens.md section 6 before using any of its numbers.
 3. **Open exploration.** Follow anything unexpected: an outlier step, a rank that is consistently early or late, a repeated pattern, a stage whose share differs from the campaign card. Use SQL first, then crops.
 
 A lead becomes a ledger candidate only after it is located (rank, stream or thread, time window,
@@ -175,6 +193,10 @@ uv run python "$SKILL_DIR/scripts/crop_trace.py" trace.json opportunity.json \
   --start-us 123456000 --duration-us 50000 --strip-args
 ```
 
+Crops drop Python frames that span the whole window, because clipped they stack into full-width
+bars that push runtime and GPU rows off screen; pass `--keep-enclosing-frames` to keep them, or
+`--drop-category python_function` to drop all Python frames.
+
 Render each crop in Perfetto and inspect the pixels directly. The bundled renderer uses
 the embedded Perfetto UI and needs network access plus Chromium:
 
@@ -183,8 +205,11 @@ uv run --with playwright python "$SKILL_DIR/scripts/render_perfetto.py" \
   opportunity.json --output-dir evidence --browser /path/to/chrome
 ```
 
-Omit `--browser` when Playwright Chromium is installed. Host Python and accelerator process rows
-are expanded automatically so their CPU threads and accelerator streams appear together. Use
+Omit `--browser` when Playwright Chromium is installed. Host and accelerator process rows are
+expanded automatically so their CPU threads and accelerator streams appear together (host rows are
+CPU-labeled processes named `python*`, or every active CPU-labeled process when none is, as with
+SGLang's `sglang::scheduler_TPn`). The renderer reads `.json.gz`, hides Perfetto's bottom panel, and
+warns when it expanded nothing; read the warnings before trusting an image. Use
 `--no-auto-expand-python` or `--no-auto-expand-gpu` only when the corresponding collapsed view is
 intentional. Use `--expand-label` for additional worker or rank rows that Perfetto initially
 collapses. Produce, at minimum:
@@ -200,7 +225,8 @@ opportunity and caption the exposed interval and dependency that makes it action
 If `ui.perfetto.dev` is unreachable, say so. Then render the crop with a simple lane plot instead
 (host threads, runtime calls, and each accelerator stream on one time axis), label it as a stand-in
 for Perfetto, or ask for network access. For several ranks side by side, crop each rank without
-`--strip-args` and merge the crops with `TraceFuse` (tracelens.md section 7).
+`--strip-args` and merge the crops with `TraceFuse` (tracelens.md section 7). Merge two ranks at a
+time, filtered to the lanes that show the dependency; four expanded ranks overflow one screenshot.
 
 ## 4. Build An Opportunity Ledger
 
@@ -235,6 +261,11 @@ apply at every tier: a zoomed image for every opportunity, and review of every i
 | A | A configuration or flag, batch or bucket sizes, removing a redundant sync, copy or cast; exact-intent and local | Benchmark A/B table; the same query or table row that exposed it, before and after; a zoomed before/after crop pair |
 | B | Overlap and scheduling, fusion, CUDA Graphs or compilation changes, transfer pipelining, stage restructuring | Overview and zoomed before/after images at matched scale; exposed-time arithmetic and Amdahl ceiling; TraceLens diff of the affected rows; fixed costs and break-even |
 | C | Custom kernels, precision or quantization, distributed or collective changes, anything numerically different or behavior-changing | Exact-shape microbenchmarks and roofline; evidence from every rank; task-quality metrics; fallback or kill-switch proof; every dependency in the images captioned; design review before the full run |
+
+A distributed or collective change alters what ranks exchange or how: the collective algorithm,
+backend or library, its environment variables, process groups, sharding, or the order or placement
+of collectives in the program. Host placement (CPU affinity, NUMA binding, thread counts) that
+leaves the exchange unchanged is tier A or B by the rules above, plus evidence from every rank.
 
 ## 5. Select And Implement One Candidate
 

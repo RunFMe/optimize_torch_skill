@@ -21,6 +21,12 @@ Use raw events for measurement and rendered timelines for dependency reasoning. 
 - Record the profiler options with the artifact. `record_shapes`, stacks, memory profiling, and Python tracing can alter eager and graph paths differently.
 - Exclude profiler runs from speed proofs.
 - Confirm the trace covers one complete measured invocation and is not truncated during asynchronous accelerator work.
+- Check profiler inflation before trusting host timings. Compare the profiled step or request rate
+  with an unprofiled measurement of the same workload: the benchmark, or the framework's own
+  counters (SGLang `last_gen_throughput` and speculative accept length, Prometheus inter-token
+  latency, vLLM step metrics). Stacks (`with_stack=True`), Python tracing and per-kernel CUPTI
+  records inside CUDA graphs all slow the host. When profiled steps are materially slower, treat
+  host durations as upper bounds and prove any host-side opportunity unprofiled first.
 - Preserve the unmodified Chrome JSON. Generate derived summaries and screenshots separately.
 
 ## 2. JSON Analysis
@@ -44,7 +50,7 @@ Where each measurement comes from:
 
 | Measurement | First source | Then |
 |---|---|---|
-| Stage durations | [trace-sql.md](trace-sql.md) section 8, split by `cat` | `summarize_trace.py --stage-regex`, whose totals add CPU and GPU copies of each range together |
+| Stage durations | [trace-sql.md](trace-sql.md) section 8, split by `cat` | `summarize_trace.py` stage table (grouped by name head and split by category) |
 | GPU busy union, idle gaps | `summarize_trace.py` | trace-sql.md section 3; TraceLens `gpu_timeline` for the compute/comm/memcpy/idle split |
 | Top kernels | TraceLens `kernel_summary` (by parent op and stream) | trace-sql.md section 7 |
 | Split dispatch (one shape, several kernels) | trace-sql.md section 12 | [kernel-roofline.md](kernel-roofline.md) section 2 to confirm |
@@ -80,6 +86,11 @@ A CPU gap is removable only when it delays the next critical GPU work.
   per-step scalar reads, state-update work, random generation, and model launches. A bubble
   visible at batch one may disappear after throughput batching.
 - Do not claim CUPTI command-buffer waits as application latency without an unprofiled A/B. They may be profiler backpressure.
+- `cudaGraphLaunch` host time grows with the graph's node count when the profiler records each
+  kernel inside the graph, and CUPTI buffer requests often land inside the longest launches. A long
+  launch with the GPU idle under it is a lead, not a measurement: time the replay with the profiler
+  off (CUDA events or wall clock around the replay), or with `nsys --cuda-graph-trace=graph`, before
+  ranking it.
 
 ## 5. Synchronization And Transfers
 

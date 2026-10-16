@@ -1,8 +1,8 @@
 # Campaign Report
 
-Write the report from the ledger, the raw benchmark outputs and the saved evidence, never from
-memory. A reader who did not follow the campaign should be able to check every claim against an
-artifact.
+Write the report from `ledger.md`, the raw benchmark outputs and the evidence pack (SKILL.md
+section 3), never from memory. A reader who did not follow the campaign should be able to check
+every claim against an artifact.
 
 This is the final deliverable. It contains the experiment table from SKILL.md section 8 (the
 Summary table), the four lists from campaign-playbook.md section 12 (shipped exact-intent, shipped
@@ -42,7 +42,8 @@ What the final trace says now: GPU time split, the largest remaining exposed cos
 they sit near an empirical roofline.
 
 ## Artifacts
-Traces, profiler options, crops, images, raw benchmark logs, and the commands that produced them.
+The `evidence/` directories and `ledger.md`; traces, raw benchmark logs, and the commands that
+produced them.
 ```
 
 ## Evidence By Tier
@@ -50,7 +51,7 @@ Traces, profiler options, crops, images, raw benchmark logs, and the commands th
 Match the depth of **Noticed** and **Outcome** to the opportunity's tier (SKILL.md section 4):
 
 - **Tier A:** one paragraph each. A benchmark table, the before/after number from the query or
-  table that exposed it, and one zoomed crop pair if the mechanism is a timing pattern.
+  table that exposed it, and a zoomed before/after crop pair.
 - **Tier B:** add an overview image placing the region on the critical path, matched-scale
   before/after zooms, the exposed-time arithmetic, the TraceLens diff rows, and fixed costs with
   break-even.
@@ -69,6 +70,8 @@ Match the depth of **Noticed** and **Outcome** to the opportunity's tier (SKILL.
 
 ## Claims
 
+- Follow every number with its source file and row, column or field, as in SKILL.md section 3
+  (Evidence Pack). Leave out any number that has no source.
 - Speed claims come only from unprofiled benchmarks; trace deltas confirm the mechanism.
 - Report isolated and cumulative effects separately and never add isolated percentages.
 - Report numerically different and behavior-changing contributions separately.

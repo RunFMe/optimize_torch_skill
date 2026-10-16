@@ -238,6 +238,12 @@ Use it as a source of leads, not as a verdict:
 - **Attribution under CUDA graphs.** A parent of `cudaGraphLaunch` says only that the kernel came
   from a graph. Use stream and kernel name, the capture folder, or the correlation query in
   trace-sql.md section 6.
+- **Kernel lists per op and shape.** The `kernel_details` column of the unique-args views
+  (`ops_unique_args`, `unified_perf_summary`) takes kernel names from the first call in each group
+  and pools durations by position. Calls that ran a different kernel with the same kernel count
+  are merged under the first call's names, and calls with a different count are skipped with a
+  warning. A split dispatch is therefore invisible there; a wide min-to-max range is the only hint.
+  Use trace-sql.md section 12.
 - **Idle is not a cause.** `macro_idle_time` includes profiler stalls, such as a long
   `cudaGraphLaunch` next to a CUPTI `Activity Buffer Request`. Find the gaps (trace-sql.md section
   3) and look inside them before calling idle time removable.

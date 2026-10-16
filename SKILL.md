@@ -130,6 +130,30 @@ do not wrap a tool in a new permanent script unless it will be reused across cam
 uv run python "$SKILL_DIR/scripts/summarize_trace.py" trace.json --top 25 --min-gap-us 100
 ```
 
+### Evidence Pack
+
+Compute numbers in code and keep them on disk; reason over the files. For each trace, write one
+directory before ranking anything:
+
+```text
+evidence/<trace-id>/
+  capture.md         command, commit, workload, profiler options, rank, trace path
+  summary.txt        summarize_trace.py output
+  tracelens/         TraceLens CSVs (per rank, collectives, comparisons)
+  queries/           NN-<name>.sql and NN-<name>.csv: every query whose result backs a claim
+  crops/, images/    crops and rendered evidence
+ledger.md            the opportunity ledger (section 4), one per campaign, next to evidence/
+```
+
+Save a query and its output whenever a number from it enters the ledger, so it can be rerun on the
+after-trace unchanged. Update `ledger.md` after every run or review rather than keeping state in the
+conversation; long campaigns lose context, the files do not.
+
+Cite every number in the ledger and report by its file and row, column or field, for example
+`(source: evidence/r0-base/queries/03-gpu-gaps.csv, row 1)` or
+`(source: evidence/r0-base/tracelens/rank0/gpu_timeline.csv, idle_time)`. Do not write a number
+that has no source file; compute it and save it first.
+
 ### Discover Opportunities
 
 Collect leads from three sources and tag each ledger row with its source:
@@ -185,7 +209,7 @@ For every candidate, record:
 | Field | Required evidence |
 |---|---|
 | Source | Required check, TraceLens report or Agent finding, or open exploration |
-| Bottleneck | The table row, query or summary line that exposed it, its location (rank, stream or thread, timestamps), and a rendered crop |
+| Bottleneck | The table row, query or summary line that exposed it, cited by file (section 3, Evidence Pack); its location (rank, stream or thread, timestamps); and a rendered crop |
 | Root cause | Dependency explanation, not only operator name |
 | Exposed time | Time on the actual critical path |
 | Roofline | FLOPs/bytes/payload, achieved rate, and realistic hardware or empirical ceiling |
@@ -272,7 +296,7 @@ Report:
 
 Confirm the mechanism with traces as well. Recapture with the same profiler settings and workload
 as the baseline trace. Rerun the exact query, summary line, or TraceLens row that exposed the
-opportunity and show that the targeted time shrank or disappeared. Compare TraceLens reports for
+opportunity (saved in the evidence pack) and show that the targeted time shrank or disappeared. Compare TraceLens reports for
 the two traces and check the GPU timeline split and top kernels for regressions elsewhere, such as
 time that moved rather than vanished. Produce the before/after images the evidence tier requires.
 A trace confirms the mechanism; the unprofiled benchmark proves the speed. Ship only with both.

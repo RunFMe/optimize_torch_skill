@@ -47,6 +47,7 @@ Where each measurement comes from:
 | Stage durations | [trace-sql.md](trace-sql.md) section 8, split by `cat` | `summarize_trace.py --stage-regex`, whose totals add CPU and GPU copies of each range together |
 | GPU busy union, idle gaps | `summarize_trace.py` | trace-sql.md section 3; TraceLens `gpu_timeline` for the compute/comm/memcpy/idle split |
 | Top kernels | TraceLens `kernel_summary` (by parent op and stream) | trace-sql.md section 7 |
+| Split dispatch (one shape, several kernels) | trace-sql.md section 12 | [kernel-roofline.md](kernel-roofline.md) section 2 to confirm |
 | Launch count and gaps | `summarize_trace.py` | trace-sql.md section 4 |
 | Syncs, scalar reads, copies | `summarize_trace.py` | trace-sql.md section 9 |
 | Allocation churn | SQL on `aten::empty*`, `cudaMalloc`/`cudaFree` and allocator events; a `profile_memory=True` trace | trace-sql.md section 5 on the window |

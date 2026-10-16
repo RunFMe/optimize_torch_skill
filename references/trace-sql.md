@@ -21,7 +21,8 @@ rank arrived first. Use TraceLens ([tracelens.md](tracelens.md)) for aggregated 
 9. Synchronization and scalar reads
 10. CPU-side collectives
 11. Cross-rank collective alignment
-12. Limits
+12. Kernel variants per op and shape
+13. Limits
 
 ## 1. Load
 
@@ -35,7 +36,7 @@ for i, path in enumerate(files):
     rank = int(re.search(r"(?:TP|rank)[-_]?(\d+)", path).group(1))   # adapt to the file naming
     con.execute(f"""
       {"CREATE OR REPLACE TABLE ev AS" if i == 0 else "INSERT INTO ev"}
-      SELECT {rank} AS rank, e.name, e.cat, e.ph, e.pid::VARCHAR AS pid, e.tid::VARCHAR AS tid,
+      SELECT {rank} AS rank, e.name, e.cat, e.ph, e.pid->>'$' AS pid, e.tid->>'$' AS tid,
              e.ts::DOUBLE AS ts, e.dur::DOUBLE AS dur, e.args
       FROM (SELECT unnest(traceEvents) AS e FROM read_json(?, maximum_object_size = 1000000000,
             columns = {{traceEvents: 'STRUCT(name VARCHAR, cat VARCHAR, ph VARCHAR, pid JSON,
@@ -54,7 +55,8 @@ as memory allows. Query afterwards from Python
 
 `ev(rank, name, cat, ph, pid, tid, ts, dur, args)`: one row per Chrome-trace event, timestamps
 in trace microseconds. Complete events have `ph = 'X'`; metadata (`thread_name`, `process_name`)
-has `ph = 'M'` with the label in `args->>'name'`.
+has `ph = 'M'` with the label in `args->>'name'`. `pid` and `tid` are text without JSON quotes,
+whether the trace wrote them as numbers or strings, so `'7'` matches either form.
 
 Useful categories in Kineto traces: `kernel`, `gpu_memcpy`, `gpu_memset`, `cuda_runtime`,
 `cuda_driver`, `cpu_op`, `python_function`, `user_annotation` (CPU `record_function` ranges),
@@ -302,7 +304,61 @@ ORDER BY wait_ms DESC LIMIT 20;
 A large `max_end_spread_us` means the pairing is wrong or the clocks disagree. Do not trust the
 waits until it is small (a few microseconds on one node).
 
-## 12. Limits
+## 12. Kernel Variants Per Op And Shape
+
+Finds ops whose calls with identical shapes, dtypes and strides run different kernels: a split
+dispatch. Each launch is attributed to the latest matching op that is still open on its thread
+(an `ASOF` join, which stays fast on large traces where a range join does not). Each call is reduced to the ordered sequence of kernels it launched, and calls are
+grouped by that sequence. Because the work is identical, the ratio of median kernel time per call
+is the efficiency ratio of the variants, with no roofline needed. Needs `record_shapes=True`, and
+ops on the host at launch time, so for CUDA-graph replay use the graph-capture traces
+(tracelens.md section 2).
+
+```sql
+SET VARIABLE op_regex = '^aten::(mm|addmm|bmm|matmul|linear|_scaled_mm|convolution)$';
+WITH k AS (
+  SELECT name AS kernel, dur, args->>'correlation' AS corr FROM ev
+  WHERE rank = getvariable('rank') AND cat = 'kernel'),
+l AS (
+  SELECT k.kernel, k.dur, k.corr, r.pid, r.tid, r.ts FROM k JOIN ev r
+    ON r.rank = getvariable('rank') AND r.cat IN ('cuda_runtime', 'cuda_driver')
+   AND (r.args->>'correlation') = k.corr),
+ops AS (
+  SELECT name, pid, tid, ts, dur, (args->>'Input Dims') AS dims, (args->>'Input type') AS dtypes,
+         (args->>'Input Strides') AS strides FROM ev
+  WHERE rank = getvariable('rank') AND cat = 'cpu_op' AND regexp_matches(name, getvariable('op_regex'))),
+o AS (   -- the latest matching op that started before each launch and is still open
+  SELECT l.kernel, l.dur, l.ts AS launch_ts, op.name AS op, op.ts AS op_ts, op.tid AS op_tid,
+         op.dims, op.dtypes, op.strides
+  FROM l ASOF JOIN ops op ON l.pid = op.pid AND l.tid = op.tid AND l.ts >= op.ts
+  WHERE op.ts + op.dur >= l.ts),
+c AS (   -- one row per call: its kernel sequence and summed kernel time
+  SELECT op, dims, dtypes, strides, string_agg(kernel, ' + ' ORDER BY launch_ts) AS kernels,
+         sum(dur) AS kernel_us
+  FROM o GROUP BY op, dims, dtypes, strides, op_ts, op_tid),
+v AS (
+  SELECT op, dims, dtypes, strides, kernels, count(*) AS calls, median(kernel_us) AS median_us,
+         sum(kernel_us) AS total_us FROM c GROUP BY ALL),
+s AS (
+  SELECT *, count(*) OVER w AS variants, min(median_us) OVER w AS best_median_us,
+         sum(calls) OVER w AS group_calls, sum(total_us) OVER w AS group_us FROM v
+  WINDOW w AS (PARTITION BY op, dims, dtypes, strides))
+SELECT op, left(dims, 60) AS dims, dtypes, left(kernels, 90) AS kernels, calls,
+       round(calls / group_calls, 2) AS share_of_calls, round(median_us, 1) AS median_us,
+       round(median_us / best_median_us, 2) AS slowdown_vs_best,
+       round(calls * (median_us - best_median_us) / 1000, 2) AS excess_ms
+FROM s WHERE variants > 1
+ORDER BY group_us DESC, median_us
+LIMIT 40;
+```
+
+`excess_ms` is the kernel time the slower variant spends over the best one; it is removable only
+where those kernels are on the critical path. A variant that differs by an extra kernel, such as a
+split-K reduction, is still a variant: its median includes that kernel. Profiled kernel durations
+are diagnostic; confirm both variants with an unprofiled exact-shape benchmark before forcing one
+([kernel-roofline.md](kernel-roofline.md) section 2).
+
+## 13. Limits
 
 - The whole file is parsed as one JSON object, so a trace needs roughly 10x its uncompressed size
   in memory. For multi-GB traces, crop first with `crop_trace.py` or use Perfetto's

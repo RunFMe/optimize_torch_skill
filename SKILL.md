@@ -12,7 +12,7 @@ Drive optimization with measured critical-path evidence. Treat traces as diagnos
 1. Freeze the target contract before ranking candidates: primary objective and metric, constraints, workload mix, work budget, output mode, exact hardware and topology, an executable access path, process lifecycle, cache reuse, and quality gate. If the objective, target hardware, or access path is missing and different choices would change the campaign, ask the user one concise question covering them. Never default silently to throughput or the currently visible device. If the contract changes, rerank the ledger.
 2. Match the first experiments to the objective. For throughput, measure saturation and batching early; for online latency, preserve the concurrency and tail-latency contract; for startup, measure a clean lifecycle; for memory or cost, optimize the corresponding peak or resource-normalized metric.
 3. Use reduced-step or repeated-shape runs only for screening. Never promote a default, publish a speed claim, or reject a fixed-cost candidate solely from a proxy whose stage shares differ materially from production.
-4. Inspect both raw Chrome JSON and rendered Perfetto images. Do not approve an opportunity from aggregate tables alone.
+4. Inspect both event-level evidence (timestamps, overlaps, launching calls) and rendered timeline images. Do not approve an opportunity from aggregate tables alone, including TraceLens tables and TraceLens Agent findings.
 5. Capture traces separately from timed runs. Profiler overhead can differ radically between eager, compiled, and CUDA-graph paths.
 6. Measure exposed critical-path time. Do not count CPU waits hidden under GPU work, rank rendezvous as transfer time, deferred work outside the timer, or overlapping kernel buckets twice.
 7. Keep inputs, shapes, batching, model state, precision, execution algorithm, work budget, and output contracts fixed unless the user explicitly accepts a behavior-changing experiment.
@@ -23,7 +23,7 @@ Drive optimization with measured critical-path evidence. Treat traces as diagnos
 12. Use independent review of expensive experiment designs and implemented winners. Fix material findings and rerun proof.
 13. Screen dominant dense kernels against an exact-shape roofline and competing kernel families. A large GEMM is not automatically efficient, and a library default is not evidence of good tensor-core utilization.
 
-Read [trace-analysis.md](references/trace-analysis.md) before interpreting a trace. Read [optimization-catalog.md](references/optimization-catalog.md) when ranking candidates. Read [benchmark-quality.md](references/benchmark-quality.md) before making a speed or parity claim. Read [kernel-roofline.md](references/kernel-roofline.md) when GEMM, convolution, attention, or another compute-dense kernel has material critical-path share or unexpectedly low achieved throughput. For a campaign with multiple hypotheses, compilation, lower precision, custom kernels, distributed execution, or host pipelining, also read [campaign-playbook.md](references/campaign-playbook.md).
+Read [trace-analysis.md](references/trace-analysis.md) before interpreting a trace. Read [tracelens.md](references/tracelens.md) before running or trusting TraceLens, and [trace-sql.md](references/trace-sql.md) before querying events. Read [campaign-report.md](references/campaign-report.md) before writing the final report. Read [optimization-catalog.md](references/optimization-catalog.md) when ranking candidates. Read [benchmark-quality.md](references/benchmark-quality.md) before making a speed or parity claim. Read [kernel-roofline.md](references/kernel-roofline.md) when GEMM, convolution, attention, or another compute-dense kernel has material critical-path share or unexpectedly low achieved throughput. For a campaign with multiple hypotheses, compilation, lower precision, custom kernels, distributed execution, or host pipelining, also read [campaign-playbook.md](references/campaign-playbook.md).
 
 ## 1. Establish The Contract
 
@@ -97,25 +97,54 @@ uv run python "$SKILL_DIR/scripts/compare_benchmarks.py" \
   --metric-path seconds --warmup 3
 ```
 
-## 3. Capture Diagnostic Traces
+## 3. Capture And Analyze Traces
+
+### Capture
 
 Run at least three complete workload-shaped warmup invocations before entering the profiler, then
 capture the next representative invocation on every rank. Profiler-scheduled warmup steps are not a
 substitute when they alter lifecycle or dispatch behavior. Export Chrome JSON with
-`export_chrome_trace`.
+`export_chrome_trace`, and record the profiler options with the trace.
 
 Use two diagnostic levels when needed:
 
 - Light trace: host and applicable accelerator activities, coarse ranges, no stacks or shapes.
-- Deep trace: shapes, memory, stacks, or module hierarchy only for a narrow workload. Never compare its wall time with a differently instrumented path.
+- Deep trace: shapes, memory, stacks, or module hierarchy only for a narrow workload. Never compare its wall time with a differently instrumented path. Take one with `record_shapes=True` when TraceLens op or roofline views are wanted; for CUDA-graph serving, also capture graph-capture traces as described in [tracelens.md](references/tracelens.md) section 2.
 
-Run the bundled analyzer:
+### Toolkit
+
+Combine these freely. Write ad hoc queries or short throwaway scripts when a question needs them;
+do not wrap a tool in a new permanent script unless it will be reused across campaigns.
+
+| Tool | Gives | Use for |
+|---|---|---|
+| `scripts/summarize_trace.py` | One streaming pass: span, GPU busy union, idle and launch gaps with timestamps, syncs, copies, collectives, lanes | First look at every trace |
+| TraceLens reports ([tracelens.md](references/tracelens.md)) | GPU time split into compute, exposed comm, memcpy and idle; kernels by parent op and stream; per-shape roofline; per-rank NCCL skew and bandwidth; trace diffs | Aggregation, collective health, before/after comparison |
+| TraceLens Agent (tracelens.md section 5) | Ranked findings with Insight, Action and Impact | A second set of leads on eager or graph-plus-capture traces |
+| DuckDB SQL ([trace-sql.md](references/trace-sql.md)) | Event-level answers in milliseconds after one load | Locating, windowing, zooming into a kernel, cross-rank alignment, any follow-up question |
+| `scripts/crop_trace.py` | A small Chrome JSON of one window, all lanes kept | Rendering and evidence |
+| `scripts/render_perfetto.py` | Perfetto screenshots of a crop | Evidence images |
+| `scripts/compare_benchmarks.py` | Unprofiled speed statistics | Speed proof (section 6) |
 
 ```bash
 uv run python "$SKILL_DIR/scripts/summarize_trace.py" trace.json --top 25 --min-gap-us 100
 ```
 
-Use the timestamps from the summary and stage ranges to make small, reviewable trace crops:
+### Discover Opportunities
+
+Collect leads from three sources and tag each ledger row with its source:
+
+1. **Required checks.** Answer every measurement in [trace-analysis.md](references/trace-analysis.md) section 2 with a number and a location.
+2. **TraceLens.** Run the per-rank report and, for distributed jobs, the collective report. Optionally run the TraceLens Agent and read its `analysis.md`. Apply the cross-checks in tracelens.md section 6 before using any of its numbers.
+3. **Open exploration.** Follow anything unexpected: an outlier step, a rank that is consistently early or late, a repeated pattern, a stage whose share differs from the campaign card. Use SQL first, then crops.
+
+A lead becomes a ledger candidate only after it is located (rank, stream or thread, time window,
+launching call or stage) and its exposed critical-path time is estimated. Where an aggregate table
+and event-level evidence disagree, trust the events and explain the difference.
+
+### Evidence Images
+
+Use the timestamps from the summary, queries and stage ranges to make small, reviewable trace crops:
 
 ```bash
 uv run python "$SKILL_DIR/scripts/crop_trace.py" trace.json opportunity.json \
@@ -144,13 +173,19 @@ Screenshots must show why time is removable, not merely that a long bar exists.
 When presenting a trace-guided plan, place or link each zoomed screenshot next to the corresponding
 opportunity and caption the exposed interval and dependency that makes it actionable.
 
+If `ui.perfetto.dev` is unreachable, say so. Then render the crop with a simple lane plot instead
+(host threads, runtime calls, and each accelerator stream on one time axis), label it as a stand-in
+for Perfetto, or ask for network access. For several ranks side by side, crop each rank without
+`--strip-args` and merge the crops with `TraceFuse` (tracelens.md section 7).
+
 ## 4. Build An Opportunity Ledger
 
 For every candidate, record:
 
 | Field | Required evidence |
 |---|---|
-| Bottleneck | Raw JSON statistics plus rendered trace location |
+| Source | Required check, TraceLens report or Agent finding, or open exploration |
+| Bottleneck | The table row, query or summary line that exposed it, its location (rank, stream or thread, timestamps), and a rendered crop |
 | Root cause | Dependency explanation, not only operator name |
 | Exposed time | Time on the actual critical path |
 | Roofline | FLOPs/bytes/payload, achieved rate, and realistic hardware or empirical ceiling |
@@ -161,10 +196,21 @@ For every candidate, record:
 | Hardware evidence | Verified target access, exact device/runtime identity, and any proxy-to-target differences |
 | Fixed costs | Compile, autotune, packing, graph capture, warmup, cache misses, and break-even at the execution unit that pays them |
 | Risks | Numerical, memory, lifecycle, deadlock, portability, compile, or maintenance |
+| Evidence tier | A, B, or C (below), chosen before implementation |
 | Acceptance | Benchmark, parity, soak, and fallback requirements |
 | Result | `ship`, `reject`, `defer`, or `retest`, with isolated and cumulative A/B evidence |
 
 Prioritize expected objective value, not inclusive operator time. Estimate `exposed share × plausible removable fraction` before implementation. Agree on an acceptance threshold appropriate to measurement noise, implementation cost, and risk; do not impose a universal percentage. Screen the cheapest disproof first: unsupported dispatch, insufficient ceiling, compile explosion, memory excess, or unacceptable numerical drift.
+
+Scale proof and explanation with the complexity and risk of the change. When unsure, choose the
+more demanding tier. Tier C requires everything in B, and B everything in A. The rules above
+apply at every tier: a zoomed image for every opportunity, and review of every implemented winner.
+
+| Tier | Typical changes | Evidence required |
+|---|---|---|
+| A | A configuration or flag, batch or bucket sizes, removing a redundant sync, copy or cast; exact-intent and local | Benchmark A/B table; the same query or table row that exposed it, before and after; a zoomed before/after crop pair |
+| B | Overlap and scheduling, fusion, CUDA Graphs or compilation changes, transfer pipelining, stage restructuring | Overview and zoomed before/after images at matched scale; exposed-time arithmetic and Amdahl ceiling; TraceLens diff of the affected rows; fixed costs and break-even |
+| C | Custom kernels, precision or quantization, distributed or collective changes, anything numerically different or behavior-changing | Exact-shape microbenchmarks and roofline; evidence from every rank; task-quality metrics; fallback or kill-switch proof; every dependency in the images captioned; design review before the full run |
 
 ## 5. Select And Implement One Candidate
 
@@ -224,6 +270,13 @@ Report:
 - Cold cost, warm cost, break-even in batches or work items per execution unit, graph/recompile counts, and whether caches survive the real lifecycle.
 - Full-pipeline time through output persistence and queue drain when the product requires those outputs.
 
+Confirm the mechanism with traces as well. Recapture with the same profiler settings and workload
+as the baseline trace. Rerun the exact query, summary line, or TraceLens row that exposed the
+opportunity and show that the targeted time shrank or disappeared. Compare TraceLens reports for
+the two traces and check the GPU timeline split and top kernels for regressions elsewhere, such as
+time that moved rather than vanished. Produce the before/after images the evidence tier requires.
+A trace confirms the mechanism; the unprofiled benchmark proves the speed. Ship only with both.
+
 Run contract and task-quality checks appropriate to the output. Audit the final diff and runtime configuration for hidden shortcuts such as less algorithmic work, smaller inputs or batches, shorter sequences, lower precision, changed weights or algorithms, disabled components, relaxed thresholds, reduced output fidelity, or skipped validation and safety work.
 
 Classify the result:
@@ -267,5 +320,9 @@ Stop when any of these holds:
 - Expected benefit is smaller than correctness, memory, portability, or maintenance risk.
 
 Before delivery, remove benchmark-only code from the implementation diff if requested, preserve local artifacts, run smoke tests for every touched optional path, and provide a table of shipped, disabled, and rejected experiments with non-additive speedup attribution.
+
+Deliver a campaign report following [campaign-report.md](references/campaign-report.md). For every
+opportunity taken, state what was noticed, what was planned, what was done, and what came out of
+it, with evidence at that opportunity's tier.
 
 Reconcile the final code, CLI defaults, documentation, benchmark harness, and decision ledger. Explicitly list live opportunities that were deferred rather than disproven. Do not call a campaign complete while a measured winner is unavailable under the target topology or while a promising candidate was screened only with a non-representative proxy.

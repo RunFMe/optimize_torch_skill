@@ -31,7 +31,7 @@ SYNC_RE = re.compile(
 )
 COPY_RE = re.compile(r"memcpy|memset|copy_|aten::to|aten::_to_copy", re.IGNORECASE)
 LAUNCH_RE = re.compile(
-    r"(?:cuda|cu)Launch(?:Kernel|CooperativeKernel|KernelEx)", re.IGNORECASE
+    r"(?:cuda|cu)(?:Launch(?:Kernel|CooperativeKernel|KernelEx)|GraphLaunch)", re.IGNORECASE
 )
 
 

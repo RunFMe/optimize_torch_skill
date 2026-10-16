@@ -40,6 +40,20 @@ Measure at least:
 
 Treat summed GPU duration as work, not wall time. Concurrent streams make summed durations exceed the critical path.
 
+Where each measurement comes from:
+
+| Measurement | First source | Then |
+|---|---|---|
+| Stage durations | [trace-sql.md](trace-sql.md) section 8, split by `cat` | `summarize_trace.py --stage-regex`, whose totals add CPU and GPU copies of each range together |
+| GPU busy union, idle gaps | `summarize_trace.py` | trace-sql.md section 3; TraceLens `gpu_timeline` for the compute/comm/memcpy/idle split |
+| Top kernels | TraceLens `kernel_summary` (by parent op and stream) | trace-sql.md section 7 |
+| Launch count and gaps | `summarize_trace.py` | trace-sql.md section 4 |
+| Syncs, scalar reads, copies | `summarize_trace.py` | trace-sql.md section 9 |
+| Allocation churn | SQL on `aten::empty*`, `cudaMalloc`/`cudaFree` and allocator events; a `profile_memory=True` trace | trace-sql.md section 5 on the window |
+| Layout and dtype conversions | TraceLens `ops_summary` (`aten::copy_`, `aten::to`, `aten::contiguous`) | trace-sql.md section 6 to find who calls them |
+| Collectives | TraceLens collective report for NCCL | trace-sql.md sections 10 and 11 for host and in-graph collectives |
+| Kernel families | TraceLens `ops_summary_by_category` | `kernel_summary` by name when graphs hide the ops |
+
 ## 3. Rendered Timeline Inspection
 
 Open the Chrome JSON in Perfetto and inspect:
@@ -93,6 +107,14 @@ Do not equate a collective bar with transfer time.
 6. Measure overlap as the intersection of collective and useful compute intervals.
 
 If the first all-gather is 300 ms but steady gathers are 2 ms, fix rank dispatch or preprocessing skew before tuning NCCL. Adding a barrier merely moves the wait.
+
+For NCCL collectives issued outside CUDA graphs, the TraceLens collective report gives per-rank
+start skew, waits, stragglers and bandwidth. Collectives replayed inside graphs lose their process
+group and drop out of those sheets, and framework all-reduce kernels are neither reported as
+collectives nor counted as communication. Align both across ranks with
+[trace-sql.md](trace-sql.md) section 11. A rank
+that waits much longer than the others arrives early; look for what delays its peers, often host
+work such as request broadcast or scheduling that differs by rank.
 
 Treat communication-library environment changes as topology-specific experiments. Validate startup, every collective order, and long soaks. A hang before model loading can be a node interconnect or fabric problem; test an unchanged known-good runtime on the same node before blaming code.
 

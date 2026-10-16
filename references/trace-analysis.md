@@ -21,6 +21,12 @@ Use raw events for measurement and rendered timelines for dependency reasoning. 
 - Record the profiler options with the artifact. `record_shapes`, stacks, memory profiling, and Python tracing can alter eager and graph paths differently.
 - Exclude profiler runs from speed proofs.
 - Confirm the trace covers one complete measured invocation and is not truncated during asynchronous accelerator work.
+- Check profiler inflation before trusting host timings. Compare the profiled step or request rate
+  with an unprofiled measurement of the same workload: the benchmark, or the framework's own
+  counters (SGLang `last_gen_throughput` and speculative accept length, Prometheus inter-token
+  latency, vLLM step metrics). Stacks (`with_stack=True`), Python tracing and per-kernel CUPTI
+  records inside CUDA graphs all slow the host. When profiled steps are materially slower, treat
+  host durations as upper bounds and prove any host-side opportunity unprofiled first.
 - Preserve the unmodified Chrome JSON. Generate derived summaries and screenshots separately.
 
 ## 2. JSON Analysis
@@ -39,6 +45,21 @@ Measure at least:
 - Kernel families relevant to the workload, such as GEMM, convolution, attention, reductions, normalization, indexing, elementwise, quantization, and copies.
 
 Treat summed GPU duration as work, not wall time. Concurrent streams make summed durations exceed the critical path.
+
+Where each measurement comes from:
+
+| Measurement | First source | Then |
+|---|---|---|
+| Stage durations | [trace-sql.md](trace-sql.md) section 8, split by `cat` | `summarize_trace.py` stage table (grouped by name head and split by category) |
+| GPU busy union, idle gaps | `summarize_trace.py` | trace-sql.md section 3; TraceLens `gpu_timeline` for the compute/comm/memcpy/idle split |
+| Top kernels | TraceLens `kernel_summary` (by parent op and stream) | trace-sql.md section 7 |
+| Split dispatch (one shape, several kernels) | trace-sql.md section 12 | [kernel-roofline.md](kernel-roofline.md) section 2 to confirm |
+| Launch count and gaps | `summarize_trace.py` | trace-sql.md section 4 |
+| Syncs, scalar reads, copies | `summarize_trace.py` | trace-sql.md section 9 |
+| Allocation churn | SQL on `aten::empty*`, `cudaMalloc`/`cudaFree` and allocator events; a `profile_memory=True` trace | trace-sql.md section 5 on the window |
+| Layout and dtype conversions | TraceLens `ops_summary` (`aten::copy_`, `aten::to`, `aten::contiguous`) | trace-sql.md section 6 to find who calls them |
+| Collectives | TraceLens collective report for NCCL | trace-sql.md sections 10 and 11 for host and in-graph collectives |
+| Kernel families | TraceLens `ops_summary_by_category` | `kernel_summary` by name when graphs hide the ops |
 
 ## 3. Rendered Timeline Inspection
 
@@ -65,6 +86,11 @@ A CPU gap is removable only when it delays the next critical GPU work.
   per-step scalar reads, state-update work, random generation, and model launches. A bubble
   visible at batch one may disappear after throughput batching.
 - Do not claim CUPTI command-buffer waits as application latency without an unprofiled A/B. They may be profiler backpressure.
+- `cudaGraphLaunch` host time grows with the graph's node count when the profiler records each
+  kernel inside the graph, and CUPTI buffer requests often land inside the longest launches. A long
+  launch with the GPU idle under it is a lead, not a measurement: time the replay with the profiler
+  off (CUDA events or wall clock around the replay), or with `nsys --cuda-graph-trace=graph`, before
+  ranking it.
 
 ## 5. Synchronization And Transfers
 
@@ -93,6 +119,14 @@ Do not equate a collective bar with transfer time.
 6. Measure overlap as the intersection of collective and useful compute intervals.
 
 If the first all-gather is 300 ms but steady gathers are 2 ms, fix rank dispatch or preprocessing skew before tuning NCCL. Adding a barrier merely moves the wait.
+
+For NCCL collectives issued outside CUDA graphs, the TraceLens collective report gives per-rank
+start skew, waits, stragglers and bandwidth. Collectives replayed inside graphs lose their process
+group and drop out of those sheets, and framework all-reduce kernels are neither reported as
+collectives nor counted as communication. Align both across ranks with
+[trace-sql.md](trace-sql.md) section 11. A rank
+that waits much longer than the others arrives early; look for what delays its peers, often host
+work such as request broadcast or scheduling that differs by rank.
 
 Treat communication-library environment changes as topology-specific experiments. Validate startup, every collective order, and long soaks. A hang before model loading can be a node interconnect or fabric problem; test an unchanged known-good runtime on the same node before blaming code.
 

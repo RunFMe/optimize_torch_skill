@@ -36,6 +36,10 @@ Extract exact production shapes and their frequency from traces or runtime instr
 
 For each shape, record stage share, invocation count, current kernel name, latency distribution, and layout. Start with the highest `exposed time × plausible removable fraction`, not merely the largest FLOP count.
 
+Check every high-share shape for split dispatch: calls with identical shapes, dtypes and strides that run different kernels. The work is identical, so the slower variant's median duration over the faster one's is its efficiency loss, and `calls × (slow median − fast median)` is removable by selecting the faster kernel, without writing a new one. Find splits with [trace-sql.md](trace-sql.md) section 12. Do not rely on TraceLens per-shape kernel lists for this; they hide splits ([tracelens.md](tracelens.md) section 6). Typical causes are heuristic or autotuner choices that depend on alignment, workspace size, stream or M bucket; an autotune cache miss; and memory-format differences. Confirm both variants with an unprofiled exact-shape benchmark, then fix the selection through the backend's own configuration rather than a one-off branch (section 6).
+
+When the trace has no shapes (CUDA-graph replay, or `record_shapes=False`), recapture with shapes or graph-capture traces ([tracelens.md](tracelens.md) section 2). Until then, bound the work from what is visible: kernel template arguments often carry tile or problem sizes (for example `router_gemm_kernel<..., 256, 6144>` or head-dimension tags such as `HQk576HV512`), and the model's `config.json` gives hidden, intermediate, head and expert sizes. Label FLOP estimates built this way as reconstructed, and do not use them to reject a candidate.
+
 Use repeated exact shapes only for screening. Preserve the real ordered shape mix for integration proof because autotuning, cache reuse, and thermal state can change results.
 
 ## 3. Calculate Useful Throughput And Ceilings

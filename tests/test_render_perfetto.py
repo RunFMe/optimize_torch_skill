@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import sys
 import tempfile
@@ -144,6 +145,37 @@ class DiscoverAcceleratorRowsTest(unittest.TestCase):
             discover_default_row_labels(trace),
             (["python 391"], ["python 0"]),
         )
+
+    def test_reads_metadata_written_at_end_of_trace(self) -> None:
+        # Kineto writes metadata after all events; scanning only the file head finds nothing.
+        events = [
+            {"ph": "X", "cat": "kernel", "name": "k", "pid": 0, "tid": 7, "ts": 1, "dur": 1},
+            *self.process_metadata(391, "python", "CPU", "main thread"),
+            *self.process_metadata(0, "python", "GPU 0", "stream 7"),
+        ]
+        trace = self.write_trace(events)
+
+        self.assertEqual(discover_default_row_labels(trace), (["python 391"], ["python 0"]))
+
+    def test_uses_cpu_processes_when_none_is_named_python(self) -> None:
+        events = [
+            *self.process_metadata(45, "sglang::scheduler_TP1", "CPU", "thread 45"),
+            *self.process_metadata(1, "sglang::scheduler_TP1", "GPU 1", "stream 144"),
+            *self.process_metadata(2, "sglang::scheduler_TP1", "GPU 2"),
+        ]
+        trace = self.write_trace(events)
+
+        self.assertEqual(
+            discover_default_row_labels(trace),
+            (["sglang::scheduler_TP1 45"], ["sglang::scheduler_TP1 1"]),
+        )
+
+    def test_reads_gzipped_trace(self) -> None:
+        trace = self.write_trace(self.process_metadata(0, "python", "GPU 0", "stream 7"))
+        compressed = trace.with_suffix(".json.gz")
+        compressed.write_bytes(gzip.compress(trace.read_bytes()))
+
+        self.assertEqual(discover_accelerator_row_labels(compressed), ["python 0"])
 
 
 if __name__ == "__main__":

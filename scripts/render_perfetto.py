@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import http.server
-import json
 import os
+import sys
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -16,7 +17,10 @@ from urllib.parse import quote
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
-METADATA_SCAN_LIMIT = 8 << 20
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # works under `python -I` too
+
+from summarize_trace import iter_trace_events  # noqa: E402
+
 ACCELERATOR_LABEL_MARKERS = (
     "accelerator",
     "cuda",
@@ -60,13 +64,14 @@ class TraceHandler(http.server.BaseHTTPRequestHandler):
             if trace is None:
                 self.send_error(404)
                 return
+            opener = gzip.open if trace.suffix == ".gz" else open
+            with opener(trace, "rb") as source:
+                payload = source.read()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(trace.stat().st_size))
+            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            with trace.open("rb") as source:
-                while chunk := source.read(1 << 20):
-                    self.wfile.write(chunk)
+            self.wfile.write(payload)
             return
         self.send_error(404)
 
@@ -74,42 +79,23 @@ class TraceHandler(http.server.BaseHTTPRequestHandler):
         return
 
 
-def iter_initial_metadata_events(trace: Path) -> Iterator[dict[str, object]]:
-    """Yield leading Chrome-trace metadata without loading the full trace."""
-    with trace.open(encoding="utf-8") as source:
-        prefix = source.read(METADATA_SCAN_LIMIT)
-
-    marker = '"traceEvents"'
-    marker_position = prefix.find(marker)
-    if marker_position < 0:
-        return
-    position = prefix.find("[", marker_position + len(marker))
-    if position < 0:
-        return
-    position += 1
-
-    decoder = json.JSONDecoder()
-    while position < len(prefix):
-        while position < len(prefix) and prefix[position] in " \t\r\n,":
-            position += 1
-        if position >= len(prefix) or prefix[position] == "]":
-            return
-        try:
-            event, position = decoder.raw_decode(prefix, position)
-        except json.JSONDecodeError:
-            return
-        if not isinstance(event, dict) or event.get("ph") != "M":
-            return
-        yield event
+def iter_metadata_events(trace: Path) -> Iterator[dict[str, object]]:
+    """Yield every metadata event. Kineto writes them at the end of the file, so scan it all."""
+    for event in iter_trace_events(trace):
+        if event.get("ph") == "M":
+            yield event
 
 
 def discover_default_row_labels(trace: Path) -> tuple[list[str], list[str]]:
-    """Return active host-Python and accelerator Perfetto process rows."""
+    """Return active host and accelerator Perfetto process rows.
+
+    Host rows are CPU-labeled processes named python*; when there are none (SGLang renames its
+    processes, e.g. `sglang::scheduler_TP0`), every active CPU-labeled process is used."""
     process_names: dict[object, str] = {}
     process_labels: dict[object, str] = {}
     processes_with_tracks: set[object] = set()
 
-    for event in iter_initial_metadata_events(trace):
+    for event in iter_metadata_events(trace):
         pid = event.get("pid")
         args = event.get("args")
         if pid is None or not isinstance(args, dict):
@@ -131,6 +117,7 @@ def discover_default_row_labels(trace: Path) -> tuple[list[str], list[str]]:
         return (1, str(pid))
 
     host_python_rows = []
+    other_host_rows = []
     accelerator_rows = []
     for pid in sorted(process_names, key=pid_sort_key):
         if pid not in processes_with_tracks:
@@ -143,12 +130,13 @@ def discover_default_row_labels(trace: Path) -> tuple[list[str], list[str]]:
         )
         if is_accelerator:
             accelerator_rows.append(row_label)
-        elif Path(process_name).name.casefold().startswith("python") and any(
-            marker in label_text for marker in HOST_LABEL_MARKERS
-        ):
-            host_python_rows.append(row_label)
+        elif any(marker in label_text for marker in HOST_LABEL_MARKERS):
+            if Path(process_name).name.casefold().startswith("python"):
+                host_python_rows.append(row_label)
+            else:
+                other_host_rows.append(row_label)
 
-    return host_python_rows, accelerator_rows
+    return host_python_rows or other_host_rows, accelerator_rows
 
 
 def discover_host_python_row_labels(trace: Path) -> list[str]:
@@ -184,7 +172,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-auto-expand-python",
         action="store_true",
-        help="leave host Python process rows collapsed",
+        help="leave host process rows collapsed",
     )
     parser.add_argument(
         "--no-auto-expand-gpu",
@@ -245,14 +233,35 @@ def main() -> int:
                 if not args.no_auto_expand_gpu:
                     labels.extend(accelerator_rows)
                 labels.extend(args.expand_label)
+                expanded = 0
                 for label in dict.fromkeys(labels):
                     try:
                         row = frame.get_by_text(label, exact=False).first
                         if row.is_visible(timeout=2_000):
                             row.click(position={"x": 8, "y": 10}, timeout=3_000)
                             page.wait_for_timeout(500)
+                            expanded += 1
+                        else:
+                            print(f"warning: Perfetto row {label!r} not visible")
                     except PlaywrightError:
                         print(f"warning: could not expand Perfetto row {label!r}")
+                if not expanded:
+                    print(
+                        f"warning: no rows expanded in {trace.name}; the image shows "
+                        "collapsed processes only. Pass --expand-label with the row names."
+                    )
+                # The drawer (Trace Doctor import errors, selection details) covers the
+                # bottom third; hide it and return to the top rows after expanding.
+                try:
+                    hide = frame.locator('button[title="Hide panel"]').first
+                    if hide.is_visible(timeout=2_000):
+                        hide.click(timeout=3_000)
+                        page.wait_for_timeout(500)
+                except PlaywrightError:
+                    print("warning: could not hide the Perfetto bottom panel")
+                page.mouse.move(args.width // 2, args.height // 2)
+                page.mouse.wheel(0, -100_000)
+                page.wait_for_timeout(500)
                 output = args.output_dir / f"{trace.stem}.png"
                 page.screenshot(path=str(output))
                 print(output)

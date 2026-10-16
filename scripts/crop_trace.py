@@ -10,7 +10,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from summarize_trace import iter_trace_events
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # works under `python -I` too
+
+from summarize_trace import iter_trace_events  # noqa: E402
 
 
 def finite_number(value: Any) -> float | None:
@@ -37,6 +39,17 @@ def matches_filters(
     return any(value in name for value in keep_names) or any(
         value in category for value in keep_categories
     )
+
+
+def is_enclosing_frame(event: dict[str, Any], start_us: float, end_us: float) -> bool:
+    """A Python stack frame that spans the whole window; clipped, it becomes a full-width bar."""
+    if str(event.get("cat", "")) != "python_function":
+        return False
+    timestamp = finite_number(event.get("ts"))
+    duration = finite_number(event.get("dur"))
+    if timestamp is None or duration is None:
+        return False
+    return timestamp < start_us and timestamp + duration > end_us
 
 
 def clip_complete_event(
@@ -75,6 +88,20 @@ def parse_args() -> argparse.Namespace:
         help="keep events whose category contains this value; repeat as needed",
     )
     parser.add_argument(
+        "--drop-category",
+        action="append",
+        default=[],
+        help="drop events whose category contains this value, e.g. python_function",
+    )
+    parser.add_argument(
+        "--keep-enclosing-frames",
+        action="store_true",
+        help=(
+            "keep python_function frames that span the whole window; by default they are "
+            "dropped because clipped stacks hide the runtime and GPU rows"
+        ),
+    )
+    parser.add_argument(
         "--strip-args",
         action="store_true",
         help="drop event argument payloads to keep visualization crops small",
@@ -89,15 +116,26 @@ def main() -> int:
     end_us = args.start_us + args.duration_us
     keep_names = [value.lower() for value in args.keep_name]
     keep_categories = [value.lower() for value in args.keep_category]
+    drop_categories = [value.lower() for value in args.drop_category]
+    metadata: list[dict[str, Any]] = []
     selected: list[dict[str, Any]] = []
+    dropped_frames = 0
     try:
         for event in iter_trace_events(args.trace):
             if event.get("ph") == "M":
-                selected.append(event)
+                metadata.append(event)
                 continue
             if not overlaps(event, args.start_us, end_us):
                 continue
             if not matches_filters(event, keep_names, keep_categories):
+                continue
+            category = str(event.get("cat", "")).lower()
+            if any(value in category for value in drop_categories):
+                continue
+            if not args.keep_enclosing_frames and is_enclosing_frame(
+                event, args.start_us, end_us
+            ):
+                dropped_frames += 1
                 continue
             result = clip_complete_event(event, args.start_us, end_us)
             if args.strip_args:
@@ -108,9 +146,13 @@ def main() -> int:
         return 2
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    # Metadata first: Kineto writes it at the end, and renderers read lane names from the start.
     with args.output.open("w", encoding="utf-8") as output:
-        json.dump({"traceEvents": selected}, output, separators=(",", ":"))
-    print(f"Wrote {len(selected):,} events to {args.output}")
+        json.dump({"traceEvents": metadata + selected}, output, separators=(",", ":"))
+    print(
+        f"Wrote {len(metadata) + len(selected):,} events to {args.output}"
+        + (f"; dropped {dropped_frames:,} enclosing Python frames" if dropped_frames else "")
+    )
     return 0
 
 
